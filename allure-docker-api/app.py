@@ -2,16 +2,122 @@ from flask import Flask, jsonify, render_template, send_file, request, send_from
 from flask_swagger_ui import get_swaggerui_blueprint
 from subprocess import call
 from werkzeug.utils import secure_filename
-import waitress, os, uuid, glob, json, base64, zipfile, io, re, shutil, tempfile, subprocess
+from functools import wraps
+from flask_jwt_extended import (
+    JWTManager, jwt_required, create_access_token, create_refresh_token,
+    get_jwt_identity, verify_jwt_in_request, jwt_refresh_token_required, get_raw_jwt
+)
+import waitress, os, uuid, glob, json, base64, zipfile, io, re, shutil, tempfile, subprocess, datetime
+from logging.config import dictConfig
+
+dictConfig({
+    'version': 1,
+    'formatters': {'default': {
+        'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
+    }},
+    'handlers': {'wsgi': {
+        'class': 'logging.StreamHandler',
+        'stream': 'ext://flask.logging.wsgi_errors_stream',
+        'formatter': 'default'
+    }},
+    'root': {
+        'level': 'INFO',
+        'handlers': ['wsgi']
+    }
+})
+
+def get_file_as_string(path_file):
+    f = None
+    content = None
+    try:
+        f = open(path_file, "r")
+        content = f.read()
+    except Exception as ex:
+        app.logger.error(str(ex))
+    finally:
+        if f is not None:
+            f.close()
+    return content
+
+def generate_security_swagger_specification():
+    if ENABLE_SECURITY_LOGIN:
+        login_endpoint = get_file_as_string("{}/swagger/security_endpoints/login_endpoint.json".format(STATIC_CONTENT))
+        logout_endpoint = get_file_as_string("{}/swagger/security_endpoints/logout_endpoint.json".format(STATIC_CONTENT))
+        refresh_endpoint = get_file_as_string("{}/swagger/security_endpoints/refresh_endpoint.json".format(STATIC_CONTENT))
+        try:
+            with open("{}/swagger/swagger.json".format(STATIC_CONTENT)) as json_file:
+                data = json.load(json_file)
+                security_schemes = { "bearerAuth": { "type":"http", "scheme":"bearer", "bearerFormat": "JWT" } }
+                login_scheme = { "type":"object", "properties":{ "username": { "type":"string" }, "password": { "type":"string" } } }
+                security_endpoint = [ { "bearerAuth": [] } ]
+                security_response = { "description": "UNAUTHORIZED", "schema": { "$ref":"#/components/schemas/response" } }
+
+                data['paths']['/login'] = eval(login_endpoint)
+                data['paths']['/logout'] = eval(logout_endpoint)
+                data['paths']['/refresh'] = eval(refresh_endpoint)
+
+                data['paths']['/latest-report']['get']['security'] = security_endpoint
+                data['paths']['/latest-report']['get']['responses']['401'] = security_response
+
+                data['paths']['/send-results']['post']['security'] = security_endpoint
+                data['paths']['/send-results']['post']['responses']['401'] = security_response
+
+                data['paths']['/generate-report']['get']['security'] = security_endpoint
+                data['paths']['/generate-report']['get']['responses']['401'] = security_response
+
+                data['paths']['/clean-results']['get']['security'] = security_endpoint
+                data['paths']['/clean-results']['get']['responses']['401'] = security_response
+
+                data['paths']['/emailable-report/render']['get']['security'] = security_endpoint
+                data['paths']['/emailable-report/render']['get']['responses']['401'] = security_response
+
+                data['paths']['/clean-history']['get']['security'] = security_endpoint
+                data['paths']['/clean-history']['get']['responses']['401'] = security_response
+
+                data['paths']['/emailable-report/export']['get']['security'] = security_endpoint
+                data['paths']['/emailable-report/export']['get']['responses']['401'] = security_response
+
+                data['paths']['/report/export']['get']['security'] = security_endpoint
+                data['paths']['/report/export']['get']['responses']['401'] = security_response
+
+                data['paths']['/projects']['post']['security'] = security_endpoint
+                data['paths']['/projects']['post']['responses']['401'] = security_response
+
+                data['paths']['/projects']['get']['security'] = security_endpoint
+                data['paths']['/projects']['get']['responses']['401'] = security_response
+
+                data['paths']['/projects/{id}']['delete']['security'] = security_endpoint
+                data['paths']['/projects/{id}']['delete']['responses']['401'] = security_response
+
+                data['paths']['/projects/{id}']['get']['security'] = security_endpoint
+                data['paths']['/projects/{id}']['get']['responses']['401'] = security_response
+
+                data['paths']['/projects/{id}/reports/{path}']['get']['security'] = security_endpoint
+                data['paths']['/projects/{id}/reports/{path}']['get']['responses']['401'] = security_response
+
+                data['components']['securitySchemes'] = security_schemes
+                data['components']['schemas']['login'] = login_scheme
+
+            with open("{}/swagger/swagger_security.json".format(STATIC_CONTENT), 'w') as outfile:
+                json.dump(data, outfile)
+        except Exception as ex:
+            app.logger.error(str(ex))
 
 app = Flask(__name__)
+app.config['JWT_SECRET_KEY'] = os.urandom(16)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+app.config['JWT_BLACKLIST_ENABLED'] = True
+app.config['JWT_BLACKLIST_TOKEN_CHECKS'] = ['access', 'refresh']
 
 DEV_MODE = 0
 HOST = '0.0.0.0'
 PORT = os.environ['PORT']
 THREADS = 7
 URL_SCHEME = 'http'
+ENABLE_SECURITY_LOGIN = False
+SECURITY_USER = None
+SECURITY_PASS = None
+
 GENERATE_REPORT_PROCESS = '{}/generateAllureReport.sh'.format(os.environ['ROOT'])
 KEEP_HISTORY_PROCESS = '{}/keepAllureHistory.sh'.format(os.environ['ROOT'])
 CLEAN_HISTORY_PROCESS = '{}/cleanAllureHistory.sh'.format(os.environ['ROOT'])
@@ -25,27 +131,29 @@ ORIGIN='api'
 
 REPORT_INDEX_FILE = 'index.html'
 DEFAULT_TEMPLATE = 'default.html'
-CSS = "https://stackpath.bootstrapcdn.com/bootswatch/4.3.1/cosmo/bootstrap.css"
-TITLE = "Emailable Report"
+EMAILABLE_REPORT_CSS = "https://stackpath.bootstrapcdn.com/bootswatch/4.3.1/cosmo/bootstrap.css"
+EMAILABLE_REPORT_TITLE = "Emailable Report"
 API_RESPONSE_LESS_VERBOSE = 0
 
 if "EMAILABLE_REPORT_CSS_CDN" in os.environ:
-    app.logger.info('Overriding CSS')
-    CSS = os.environ['EMAILABLE_REPORT_CSS_CDN']
+    EMAILABLE_REPORT_CSS = os.environ['EMAILABLE_REPORT_CSS_CDN']
+    app.logger.info('Overriding CSS for Emailable Report. EMAILABLE_REPORT_CSS_CDN={}'.format(EMAILABLE_REPORT_CSS))
 
 if "EMAILABLE_REPORT_TITLE" in os.environ:
-    app.logger.info('Overriding Title')
-    TITLE = os.environ['EMAILABLE_REPORT_TITLE']
+    EMAILABLE_REPORT_TITLE = os.environ['EMAILABLE_REPORT_TITLE']
+    app.logger.info('Overriding Title for Emailable Report. EMAILABLE_REPORT_TITLE={}'.format(EMAILABLE_REPORT_TITLE))
 
 if "API_RESPONSE_LESS_VERBOSE" in os.environ:
     try:
         API_RESPONSE_LESS_VERBOSE = int(os.environ['API_RESPONSE_LESS_VERBOSE'])
+        app.logger.info('Overriding API_RESPONSE_LESS_VERBOSE={}'.format(API_RESPONSE_LESS_VERBOSE))
     except Exception as ex:
         app.logger.error('Wrong env var value. Setting API_RESPONSE_LESS_VERBOSE=0 by default')
 
 if "DEV_MODE" in os.environ:
     try:
         DEV_MODE = int(os.environ['DEV_MODE'])
+        app.logger.info('Overriding DEV_MODE={}'.format(DEV_MODE))
     except Exception as ex:
         app.logger.error('Wrong env var value. Setting DEV_MODE=0 by default')
 
@@ -54,8 +162,25 @@ if "TLS" in os.environ:
         is_tls = int(os.environ['TLS'])
         if is_tls == 1:
             URL_SCHEME = 'https'
+            app.logger.info('Enabling TLS={}'.format(is_tls))
     except Exception as ex:
         app.logger.error('Wrong env var value. Setting TLS=0 by default')
+
+if "SECURITY_USER" in os.environ:
+    security_user = os.environ['SECURITY_USER']
+    if security_user and security_user.strip():
+        SECURITY_USER = security_user.lower()
+        app.logger.info('Setting SECURITY_USER')
+
+if "SECURITY_PASS" in os.environ:
+    security_pass = os.environ['SECURITY_PASS']
+    if security_pass and security_pass.strip():
+        SECURITY_PASS = security_pass
+        app.logger.info('Setting SECURITY_PASS')
+
+if SECURITY_USER and SECURITY_PASS:
+    ENABLE_SECURITY_LOGIN = True
+    app.logger.info('Enabling Security Login. ENABLE_SECURITY_LOGIN=True')
 
 ### swagger specific ###
 SWAGGER_URL = '/allure-docker-service/swagger'
@@ -69,6 +194,127 @@ SWAGGERUI_BLUEPRINT = get_swaggerui_blueprint(
 )
 app.register_blueprint(SWAGGERUI_BLUEPRINT, url_prefix=SWAGGER_URL)
 ### end swagger specific ###
+
+### Security Section
+generate_security_swagger_specification()
+blacklist = set()
+jwt = JWTManager(app)
+
+@jwt.token_in_blacklist_loader
+def check_if_token_in_blacklist(decrypted_token):
+    jti = decrypted_token['jti']
+    return jti in blacklist
+
+@jwt.invalid_token_loader
+def invalid_token_loader(msg):
+    return jsonify({
+        'meta_data': {
+            'message': 'Invalid Token'
+        }
+    }), 401
+
+@jwt.unauthorized_loader
+def unauthorized_loader(msg):
+    return jsonify({
+        'meta_data': {
+            'message': msg
+        }
+    }), 401
+
+@jwt.expired_token_loader
+def my_expired_token_callback(expired_token):
+    token_type = expired_token['type']
+    return jsonify({
+        'meta_data': {
+            'message': 'The {} token has expired'.format(token_type),
+            'sub_status': 42,
+        }
+    }), 401
+
+@jwt.revoked_token_loader
+def revoked_token_loader():
+    return jsonify({
+        'meta_data': {
+            'message': 'Revoked Token'
+        }
+    }), 401
+
+def jwt_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if ENABLE_SECURITY_LOGIN:
+            verify_jwt_in_request()
+        return fn(*args, **kwargs)
+    return wrapper
+### end Security Section
+
+### Security Endpoints Section
+@app.route('/login', methods=['POST'], strict_slashes=False)
+@app.route('/allure-docker-service/login', methods=['POST'], strict_slashes=False)
+def login():
+    try:
+        content_type = request.content_type
+        if content_type is None and content_type != 'application/json':
+            raise Exception("Header 'Content-Type' must be 'application/json'")
+
+        if not request.is_json:
+            raise Exception("Missing JSON in body request")
+
+        username = request.json.get('username', None)
+        if not username:
+            raise Exception("Missing 'username' attribute")
+
+        password = request.json.get('password', None)
+        if not password:
+            raise Exception("Missing 'password' attribute")
+
+        if SECURITY_USER != username.lower() or SECURITY_PASS != password:
+            return jsonify({ 'meta_data': { 'message' : 'Invalid username/password' } }), 401
+
+        json = {
+            'data': {
+                'access_token': create_access_token(identity=SECURITY_USER),
+                'refresh_token': create_refresh_token(identity=SECURITY_USER)
+            },
+            'meta_data': {
+                'message' : 'Successfully logged'
+            }
+        }
+        return jsonify(json), 200
+    except Exception as ex:
+        body = {
+            'meta_data': {
+                'message' : str(ex)
+            }
+        }
+        resp = jsonify(body)
+        resp.status_code = 400
+        return resp
+
+@app.route('/logout', methods=['DELETE'], strict_slashes=False)
+@app.route('/allure-docker-service/logout', methods=['DELETE'], strict_slashes=False)
+@jwt_required
+def logout():
+    jti = get_raw_jwt()['jti']
+    blacklist.add(jti)
+    return jsonify({ 'meta_data': { 'message' : 'Successfully logged out' } }), 200
+
+
+@app.route('/refresh', methods=['POST'], strict_slashes=False)
+@app.route('/allure-docker-service/refresh', methods=['POST'], strict_slashes=False)
+@jwt_refresh_token_required
+def refresh():
+    current_user = get_jwt_identity()
+    json = {
+        'data': {
+            'access_token': create_access_token(identity=current_user)
+        },
+        'meta_data': {
+            'message' : 'Successfully token obtained'
+        }
+    }
+    return jsonify(json), 200
+### end Security Endpoints Section
 
 @app.route("/", strict_slashes=False)
 @app.route("/allure-docker-service", strict_slashes=False)
@@ -89,7 +335,11 @@ def index():
 @app.route("/allure-docker-service/swagger.json", strict_slashes=False)
 def swagger_json():
     try:
-        return send_file("{}/swagger.json".format(STATIC_CONTENT), mimetype='application/json')
+        specification_file = 'swagger.json'
+        if ENABLE_SECURITY_LOGIN:
+            specification_file = 'swagger_security.json'
+
+        return send_file("{}/swagger/{}".format(STATIC_CONTENT, specification_file), mimetype='application/json')
     except Exception as ex:
         body = {
             'meta_data': {
@@ -132,8 +382,24 @@ def version():
 
     return resp
 
+@app.route("/ui/<path:path>")
+@app.route("/allure-docker-service/ui/<path:path>")
+def ui(path):
+    try:
+        return send_from_directory('{}/ui'.format(STATIC_CONTENT), path)
+    except Exception as ex:
+        body = {
+            'meta_data': {
+                'message' : str(ex)
+            }
+        }
+        resp = jsonify(body)
+        resp.status_code = 400
+        return resp
+
 @app.route("/latest-report", strict_slashes=False)
 @app.route("/allure-docker-service/latest-report", strict_slashes=False)
+@jwt_required
 def latest_report():
     try:
         project_id = resolve_project(request.args.get('project_id'))
@@ -162,6 +428,7 @@ def latest_report():
 
 @app.route("/send-results", methods=['POST'], strict_slashes=False)
 @app.route("/allure-docker-service/send-results", methods=['POST'], strict_slashes=False)
+@jwt_required
 def send_results():
     try:
         content_type = request.content_type
@@ -314,6 +581,7 @@ def send_results():
 
 @app.route("/generate-report", strict_slashes=False)
 @app.route("/allure-docker-service/generate-report", strict_slashes=False)
+@jwt_required
 def generate_report():
     try:
         project_id = resolve_project(request.args.get('project_id'))
@@ -397,6 +665,7 @@ def generate_report():
 
 @app.route("/clean-history", strict_slashes=False)
 @app.route("/allure-docker-service/clean-history", strict_slashes=False)
+@jwt_required
 def clean_history():
     try:
         project_id = resolve_project(request.args.get('project_id'))
@@ -434,6 +703,7 @@ def clean_history():
 
 @app.route("/clean-results", strict_slashes=False)
 @app.route("/allure-docker-service/clean-results", strict_slashes=False)
+@jwt_required
 def clean_results():
     try:
         project_id = resolve_project(request.args.get('project_id'))
@@ -472,6 +742,7 @@ def clean_results():
 
 @app.route("/emailable-report/render", strict_slashes=False)
 @app.route("/allure-docker-service/emailable-report/render", strict_slashes=False)
+@jwt_required
 def emailable_report_render():
     try:
         project_id = resolve_project(request.args.get('project_id'))
@@ -507,7 +778,7 @@ def emailable_report_render():
             app.logger.info('Overriding Allure Server Url')
             server_url = os.environ['SERVER_URL']
 
-        report = render_template(DEFAULT_TEMPLATE, css=CSS, title=TITLE, projectId=project_id, serverUrl=server_url, testCases=testCases)
+        report = render_template(DEFAULT_TEMPLATE, css=EMAILABLE_REPORT_CSS, title=EMAILABLE_REPORT_TITLE, projectId=project_id, serverUrl=server_url, testCases=testCases)
 
         emailable_report_path = '{}/reports/{}'.format(project_path, EMAILABLE_REPORT_FILE_NAME)
         f = None
@@ -531,6 +802,7 @@ def emailable_report_render():
 
 @app.route("/emailable-report/export", strict_slashes=False)
 @app.route("/allure-docker-service/emailable-report/export", strict_slashes=False)
+@jwt_required
 def emailable_report_export():
     try:
         project_id = resolve_project(request.args.get('project_id'))
@@ -566,6 +838,7 @@ def emailable_report_export():
 
 @app.route("/report/export", strict_slashes=False)
 @app.route("/allure-docker-service/report/export", strict_slashes=False)
+@jwt_required
 def report_export():
     try:
         project_id = resolve_project(request.args.get('project_id'))
@@ -623,6 +896,7 @@ def report_export():
 
 @app.route("/projects", methods=['POST'], strict_slashes=False)
 @app.route("/allure-docker-service/projects", methods=['POST'], strict_slashes=False)
+@jwt_required
 def create_project():
     try:
         if not request.is_json:
@@ -683,6 +957,7 @@ def create_project():
 
 @app.route('/projects/<project_id>', methods=['DELETE'], strict_slashes=False)
 @app.route("/allure-docker-service/projects/<project_id>", methods=['DELETE'], strict_slashes=False)
+@jwt_required
 def delete_project(project_id):
     try:
         if project_id == 'default':
@@ -720,6 +995,7 @@ def delete_project(project_id):
 
 @app.route('/projects/<project_id>', strict_slashes=False)
 @app.route("/allure-docker-service/projects/<project_id>", strict_slashes=False)
+@jwt_required
 def get_project(project_id):
     try:
         if is_existent_project(project_id) is False:
@@ -782,6 +1058,7 @@ def get_project(project_id):
 
 @app.route('/projects', strict_slashes=False)
 @app.route("/allure-docker-service/projects", strict_slashes=False)
+@jwt_required
 def get_projects():
     try:
         directories = os.listdir(PROJECTS_DIRECTORY)
@@ -816,6 +1093,7 @@ def get_projects():
 
 @app.route('/projects/<project_id>/reports/<path:path>')
 @app.route("/allure-docker-service/projects/<project_id>/reports/<path:path>")
+@jwt_required
 def get_reports(project_id, path):
     try:
         project_path = '{}/reports/{}'.format(project_id, path)

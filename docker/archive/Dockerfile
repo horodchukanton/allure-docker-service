@@ -19,7 +19,7 @@ RUN apt-get install unzip -y
 RUN ln -s `which python3` /usr/bin/python
 RUN pip3 install --upgrade pip
 RUN pip install -Iv setuptools==47.1.1 wheel==0.34.2 waitress==1.4.4
-RUN pip install -Iv Flask==1.1.2 flask-swagger-ui==3.25.0 requests==2.23.0
+RUN pip install -Iv Flask==1.1.2 Flask-JWT-Extended==3.24.1 flask-swagger-ui==3.25.0 requests==2.23.0
 RUN apt-get install --reinstall procps -y
 RUN apt-get install wget -y
 
