@@ -9,7 +9,6 @@ ARG BUILD_REF
 ARG ARCH
 ARG ALLURE_RELEASE=NONE
 ARG ALLURE_REPO=https://dl.bintray.com/qameta/maven/io/qameta/allure/allure-commandline
-ARG QEMU_ARCH
 ARG UID=1000
 ARG GID=1000
 
@@ -25,9 +24,6 @@ LABEL org.label-schema.build-date=${BUILD_DATE} \
     org.label-schema.vcs-url="https://github.com/fescobar/allure-docker-service" \
     org.label-schema.arch=${ARCH} \
     authors="Frank Escobar <fescobar.systems@gmail.com>, Raymond Mouthaan <raymondmmouthaan@gmail.com>"
-
-# QEMU - Quick Emulation
-COPY tmp/qemu-$QEMU_ARCH-static /usr/bin/qemu-$QEMU_ARCH-static
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
