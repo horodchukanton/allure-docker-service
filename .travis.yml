@@ -8,8 +8,8 @@ language: bash
 
 env:
   global:
-    - ALLURE_RELEASE=2.13.4
-    - TARGET=frankescobar/allure-docker-service
+    - ALLURE_RELEASE=2.13.5
+    - TARGET=horodchukanton/allure-docker-service
     - QEMU_VERSION=v4.0.0
   matrix:
     - DOCKER_FILE=Dockerfile.bionic ARCH=amd64   JDK=adoptopenjdk:11-jre-openj9-bionic  QEMU_ARCH=x86_64
